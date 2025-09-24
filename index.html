@@ -6,6 +6,36 @@
     <title>GreenPoints App</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <!-- QR Scanner will be loaded dynamically -->
+    <!-- Firebase compat builds (namespace: window.firebase) -->
+    <!-- Using a stable SDK version -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-firestore-compat.js"></script>
+    <script>
+      // Initialize Firebase (compat)
+      const firebaseConfig = {
+        apiKey: "AIzaSyCPCIj4lDZxrVaik-V5AWgAramnRx1bq7E",
+        authDomain: "greenpoints-a167b.firebaseapp.com",
+        projectId: "greenpoints-a167b",
+        storageBucket: "greenpoints-a167b.firebasestorage.app",
+        messagingSenderId: "865019744532",
+        appId: "1:865019744532:web:596f76dd99d60192787201"
+      };
+      firebase.initializeApp(firebaseConfig);
+      // Set auth persistence with graceful fallback
+      (async () => {
+        try {
+          await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+        } catch (e) {
+          try {
+            await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.SESSION);
+          } catch (e2) {
+            console.warn('Auth persistence unavailable in this environment');
+          }
+        }
+      })();
+    </script>
     <style>
         .animate-bounce {
             animation: bounce 1s infinite;
@@ -46,24 +76,38 @@
     </div>
 
     <script>
+        // Defensive guard: warn if Firebase failed to load
+        if (!window.firebase) {
+            window.addEventListener('load', () => {
+                if (!window.firebase) {
+                    alert('Firebase failed to load. Check network/ad-blockers and try again.');
+                }
+            });
+        }
+        
         // App state
         let currentScreen = 'login';
         let userPoints = 245;
         let showConfetti = false;
         let onboardingStep = 0;
         let scanningQR = false;
+        let qrScanner = null;
+        let hasCameraPermission = null;
         let selectedReward = null;
         let showRedemptionQR = false;
         let activeTab = 'individual';
+        let currentUser = null;
+        let userData = null;
+        let isLoading = false;
+        let authError = null;
+        let currentRedemption = null;
 
         // Data
         const rewards = [
             { id: 1, name: 'Canteen 20% Off', category: 'food', points: 50, icon: 'coffee', color: 'bg-orange-100 text-orange-600' },
             { id: 2, name: 'Free Notebook', category: 'stationery', points: 80, icon: 'book-open', color: 'bg-blue-100 text-blue-600' },
-            { id: 3, name: 'VIP Event Entry', category: 'events', points: 150, icon: 'ticket', color: 'bg-purple-100 text-purple-600' },
             { id: 4, name: 'Pizza Combo', category: 'food', points: 120, icon: 'coffee', color: 'bg-red-100 text-red-600' },
             { id: 5, name: 'Eco Bag', category: 'stationery', points: 60, icon: 'book-open', color: 'bg-green-100 text-green-600' },
-            { id: 6, name: 'Concert Pass', category: 'events', points: 200, icon: 'ticket', color: 'bg-indigo-100 text-indigo-600' }
         ];
 
         const leaderboard = [
@@ -94,39 +138,427 @@
             { date: '2025-09-20', type: 'Plastic Bottle', points: 10, bin: 'BIN-CLG-2025-001' }
         ];
 
+        // Firebase Authentication Functions
+        async function signUpWithEmail(email, password, userInfo) {
+            try {
+                isLoading = true;
+                authError = null;
+                renderCurrentScreen();
+                
+                const userCredential = await firebase.auth().createUserWithEmailAndPassword(email, password);
+                const user = userCredential.user;
+                
+                // Create user document in Firestore
+                await firebase.firestore().collection('users').doc(user.uid).set({
+                    email: user.email,
+                    displayName: userInfo.name || user.email.split('@')[0],
+                    department: userInfo.department || 'Computer Science',
+                    points: 0,
+                    totalRecycled: 0,
+                    treesSaved: 0,
+                    badges: ['Green Rookie'],
+                    createdAt: new Date(),
+                    lastLogin: new Date()
+                });
+                
+                await loadUserData(user.uid);
+                setCurrentScreen('onboarding');
+            } catch (error) {
+                authError = error.message;
+                renderCurrentScreen();
+            } finally {
+                isLoading = false;
+            }
+        }
+
+        async function signInWithEmail(email, password) {
+            try {
+                isLoading = true;
+                authError = null;
+                renderCurrentScreen();
+                
+                const userCredential = await firebase.auth().signInWithEmailAndPassword(email, password);
+                await loadUserData(userCredential.user.uid);
+                setCurrentScreen('home');
+            } catch (error) {
+                authError = error.message;
+                renderCurrentScreen();
+            } finally {
+                isLoading = false;
+            }
+        }
+
+        async function signInWithGoogle() {
+            try {
+                isLoading = true;
+                authError = null;
+                renderCurrentScreen();
+                
+                const provider = new firebase.auth.GoogleAuthProvider();
+                const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+                if (isMobile) {
+                    await firebase.auth().signInWithRedirect(provider);
+                    return;
+                }
+                try {
+                    const result = await firebase.auth().signInWithPopup(provider);
+                    const user = result.user;
+                    await handlePostAuth(user);
+                    setCurrentScreen('home');
+                } catch (popupError) {
+                    // Fallback to redirect on popup issues or policy blocks
+                    await firebase.auth().signInWithRedirect(provider);
+                }
+            } catch (error) {
+                authError = error.message;
+                renderCurrentScreen();
+            } finally {
+                isLoading = false;
+            }
+        }
+
+        async function signOut() {
+            try {
+                await firebase.auth().signOut();
+                currentUser = null;
+                userData = null;
+                setCurrentScreen('login');
+            } catch (error) {
+                console.error('Sign out error:', error);
+            }
+        }
+
+        // Shared post-auth handler for Google popup/redirect
+        async function handlePostAuth(user) {
+            // Check if user document exists
+            const userDoc = await firebase.firestore().collection('users').doc(user.uid).get();
+            if (!userDoc.exists) {
+                await firebase.firestore().collection('users').doc(user.uid).set({
+                    email: user.email,
+                    displayName: user.displayName || (user.email ? user.email.split('@')[0] : 'User'),
+                    department: 'Computer Science',
+                    points: 0,
+                    totalRecycled: 0,
+                    treesSaved: 0,
+                    badges: ['Green Rookie'],
+                    createdAt: new Date(),
+                    lastLogin: new Date()
+                });
+            } else {
+                await firebase.firestore().collection('users').doc(user.uid).update({ lastLogin: new Date() });
+            }
+            await loadUserData(user.uid);
+        }
+
+        async function loadUserData(uid) {
+            try {
+                const userDoc = await firebase.firestore().collection('users').doc(uid).get();
+                if (userDoc.exists) {
+                    userData = userDoc.data();
+                    userPoints = userData.points || 0;
+                    currentUser = uid;
+                }
+            } catch (error) {
+                console.error('Error loading user data:', error);
+            }
+        }
+
+        async function updateUserPoints(pointsToAdd) {
+            if (!currentUser) return;
+            
+            try {
+                const newPoints = userPoints + pointsToAdd;
+                await firebase.firestore().collection('users').doc(currentUser).update({ points: newPoints });
+                userPoints = newPoints;
+                
+                // Add to recycling history
+                await firebase.firestore().collection('recyclingHistory').add({
+                    userId: currentUser,
+                    type: 'Plastic Bottle', // This would come from QR scan
+                    points: pointsToAdd,
+                    bin: 'BIN-CLG-2025-001', // This would come from QR scan
+                    timestamp: new Date()
+                });
+                
+                renderCurrentScreen();
+            } catch (error) {
+                console.error('Error updating points:', error);
+            }
+        }
+
+        // Redemption flow
+        async function createRedemption(reward) {
+            if (!currentUser) return null;
+            const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+            const redemptionDoc = {
+                studentId: currentUser,
+                rewardName: reward.name,
+                points: reward.points,
+                status: 'pending',
+                createdAt: new Date(),
+                expiresAt: expiresAt,
+            };
+            const ref = await firebase.firestore().collection('redemptions').add(redemptionDoc);
+            return ref.id;
+        }
+
+        async function processRedemption(redemptionId) {
+            try {
+                await firebase.firestore().runTransaction(async (tx) => {
+                    const redRef = firebase.firestore().collection('redemptions').doc(redemptionId);
+                    const snap = await tx.get(redRef);
+                    if (!snap.exists) {
+                        throw new Error('Invalid redemption');
+                    }
+                    const data = snap.data();
+                    if (data.status !== 'pending') {
+                        throw new Error('Already processed');
+                    }
+                    if (data.expiresAt && data.expiresAt.toDate && data.expiresAt.toDate() < new Date()) {
+                        throw new Error('QR expired');
+                    }
+                    const userRef = firebase.firestore().collection('users').doc(data.studentId);
+                    const userSnap = await tx.get(userRef);
+                    if (!userSnap.exists) {
+                        throw new Error('Student not found');
+                    }
+                    const u = userSnap.data();
+                    const newPts = (u.points || 0) - data.points;
+                    if (newPts < 0) {
+                        throw new Error('Insufficient points');
+                    }
+                    tx.update(userRef, { points: newPts });
+                    tx.update(redRef, {
+                        status: 'completed',
+                        completedAt: new Date(),
+                        vendorId: currentUser || 'vendor-guest'
+                    });
+                });
+                // Refresh local state if student is same user
+                if (currentUser) {
+                    await loadUserData(currentUser);
+                }
+                alert('Redemption successful');
+                setCurrentScreen('home');
+            } catch (e) {
+                alert('Redemption failed: ' + e.message);
+            }
+        }
+
+        // Form handlers
+        async function handleEmailLogin(event) {
+            event.preventDefault();
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            await signInWithEmail(email, password);
+        }
+
+        async function handleEmailRegister(event) {
+            event.preventDefault();
+            const name = document.getElementById('regName').value;
+            const email = document.getElementById('regEmail').value;
+            const department = document.getElementById('regDepartment').value;
+            const password = document.getElementById('regPassword').value;
+            
+            await signUpWithEmail(email, password, { name, department });
+        }
+
         // Helper functions
         function setCurrentScreen(screen) {
+            // Stop any active scanners before navigation to avoid crashes
+            try { if (qrScanner) { stopQrScanner(); } } catch (_) {}
+            try { if (vendorScanner) { stopVendorScanner(); } } catch (_) {}
             currentScreen = screen;
             renderCurrentScreen();
         }
 
-        function handleScanQR() {
-            scanningQR = true;
-            renderCurrentScreen();
-            
-            setTimeout(() => {
+        async function startQrScanner() {
+            if (qrScanner) return;
+            const containerId = "qr-reader";
+            try {
+                scanningQR = true;
+                renderCurrentScreen();
+                const statusEl = document.getElementById('scan-status');
+                if (statusEl) statusEl.textContent = 'Initializing camera...';
+                // basic secure-context check
+                if (!(location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+                    throw new Error('Camera requires HTTPS or localhost');
+                }
+                // test camera availability/permission first
+                await ensureCameraAccess();
+                if (statusEl) statusEl.textContent = 'Loading scanner...';
+                // ensure library is loaded
+                await ensureHtml5Qrcode();
+                const mountEl = document.getElementById(containerId);
+                if (!mountEl) throw new Error('Scanner container missing');
+                qrScanner = new Html5Qrcode(containerId, { verbose: false });
+                const constraintsList = [
+                    { facingMode: 'environment' },
+                    { facingMode: 'user' }
+                ];
+                let started = false;
+                if (statusEl) statusEl.textContent = 'Starting camera...';
+                for (const constraints of constraintsList) {
+                    try {
+                        await qrScanner.start(constraints, { fps: 8, qrbox: { width: 240, height: 240 }, aspectRatio: 1.3 }, onQrSuccess, onQrError);
+                        started = true;
+                        break;
+                    } catch (_) {}
+                }
+                if (!started) {
+                    // fallback: enumerate cameras
+                    const cameras = await Html5Qrcode.getCameras();
+                    if (!cameras || !cameras.length) throw new Error('No camera found');
+                    const cameraId = cameras[0].id;
+                    await qrScanner.start({ deviceId: { exact: cameraId } }, { fps: 8, qrbox: { width: 240, height: 240 }, aspectRatio: 1.3 }, onQrSuccess, onQrError);
+                }
+                if (statusEl) statusEl.textContent = 'Scanner ready';
+                hasCameraPermission = true;
+            } catch (e) {
+                console.error('QR start error', e);
+                hasCameraPermission = false;
                 scanningQR = false;
-                showConfetti = true;
-                userPoints += 10;
-                setTimeout(() => {
-                    showConfetti = false;
-                    setCurrentScreen('home');
-                }, 3000);
-                setCurrentScreen('home');
-            }, 2000);
+                renderCurrentScreen();
+                setTimeout(() => alert('Unable to access camera: ' + e.message + '\nTips: Close other apps using camera, ensure permission allowed, try switching camera below.'), 0);
+                // Populate camera selector if available
+                try { await populateCameraSelector(); } catch (_) {}
+            }
         }
 
-        function handleRedeemReward(reward) {
+        async function stopQrScanner() {
+            try {
+                if (qrScanner) {
+                    await qrScanner.stop();
+                    await qrScanner.clear();
+                }
+            } catch (_) {}
+            qrScanner = null;
+            scanningQR = false;
+        }
+
+        async function onQrSuccess(decodedText) {
+            await stopQrScanner();
+            showConfetti = true;
+            await updateUserPoints(10);
+            setTimeout(() => {
+                showConfetti = false;
+                setCurrentScreen('home');
+            }, 1800);
+            setCurrentScreen('home');
+        }
+
+        function onQrError(_) {
+            // ignore scan errors; library calls this frequently
+        }
+
+        function ensureHtml5Qrcode() {
+            const sources = [
+                'https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.10/html5-qrcode.min.js',
+                'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.10/dist/html5-qrcode.min.js',
+                'https://unpkg.com/html5-qrcode@2.3.10/dist/html5-qrcode.min.js',
+                'https://unpkg.com/html5-qrcode/dist/html5-qrcode.min.js'
+            ];
+            return new Promise((resolve, reject) => {
+                if (window.Html5Qrcode) return resolve();
+                const tryLoad = (idx) => {
+                    if (idx >= sources.length) return reject(new Error('Failed to load html5-qrcode'));
+                    const existing = document.querySelector(`script[data-qr="html5-qrcode-${idx}"]`);
+                    if (existing) {
+                        existing.addEventListener('load', () => resolve());
+                        existing.addEventListener('error', () => tryLoad(idx + 1));
+                        return;
+                    }
+                    const s = document.createElement('script');
+                    s.src = sources[idx];
+                    s.async = true;
+                    s.defer = true;
+                    s.setAttribute('data-qr', `html5-qrcode-${idx}`);
+                    s.onload = () => { console.info('Loaded html5-qrcode from', sources[idx]); resolve(); };
+                    s.onerror = () => tryLoad(idx + 1);
+                    document.head.appendChild(s);
+                };
+                tryLoad(0);
+            });
+        }
+
+        // Lightweight QR code generator loader (for rendering redemption QR locally)
+        function ensureQrcodeLib() {
+            const sources = [
+                'https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js',
+                'https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js',
+                'https://cdnjs.cloudflare.com/ajax/libs/qrcode/1.5.1/qrcode.min.js'
+            ];
+            return new Promise((resolve, reject) => {
+                if (window.QRCode && (window.QRCode.toCanvas || window.QRCode.toDataURL)) return resolve();
+                const tryLoad = (idx) => {
+                    if (idx >= sources.length) return reject(new Error('Failed to load QR generator'));
+                    const existing = document.querySelector(`script[data-qrgen="qrcode-${idx}"]`);
+                    if (existing) {
+                        existing.addEventListener('load', () => resolve());
+                        existing.addEventListener('error', () => tryLoad(idx + 1));
+                        return;
+                    }
+                    const s = document.createElement('script');
+                    s.src = sources[idx];
+                    s.async = true;
+                    s.defer = true;
+                    s.setAttribute('data-qrgen', `qrcode-${idx}`);
+                    s.onload = () => { console.info('Loaded QR generator from', sources[idx]); resolve(); };
+                    s.onerror = () => tryLoad(idx + 1);
+                    document.head.appendChild(s);
+                };
+                tryLoad(0);
+            });
+        }
+
+        async function renderRedemptionQr() {
+            try {
+                await ensureQrcodeLib();
+                const mount = document.getElementById('redemption-qr');
+                if (!mount || !currentRedemption || !currentRedemption.id) return;
+                // Clear previous
+                mount.innerHTML = '';
+                // Prefer canvas for crispness
+                if (window.QRCode && window.QRCode.toCanvas) {
+                    const canvas = document.createElement('canvas');
+                    await window.QRCode.toCanvas(canvas, String(currentRedemption.id), { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    mount.appendChild(canvas);
+                } else if (window.QRCode && window.QRCode.toDataURL) {
+                    const url = await window.QRCode.toDataURL(String(currentRedemption.id), { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    const img = document.createElement('img');
+                    img.src = url;
+                    img.alt = 'QR';
+                    img.width = 192;
+                    img.height = 192;
+                    mount.appendChild(img);
+                } else {
+                    mount.textContent = 'QR library not available';
+                }
+            } catch (e) {
+                console.error('Failed to render QR:', e);
+                const mount = document.getElementById('redemption-qr');
+                if (mount) mount.textContent = 'Failed to render QR: ' + e.message;
+            }
+        }
+
+        async function ensureCameraAccess() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                throw new Error('Camera API not available in this browser');
+            }
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+            // Immediately stop tracks, we only wanted permission and availability check
+            stream.getTracks().forEach(t => t.stop());
+        }
+
+        async function handleRedeemReward(reward) {
             if (userPoints >= reward.points) {
                 selectedReward = reward;
+                const redId = await createRedemption(reward);
+                currentRedemption = { id: redId, reward: reward };
                 showRedemptionQR = true;
-                userPoints -= reward.points;
                 renderCurrentScreen();
-                setTimeout(() => {
-                    showRedemptionQR = false;
-                    selectedReward = null;
-                    renderCurrentScreen();
-                }, 10000);
+            } else {
+                alert('Not enough points');
             }
         }
 
@@ -142,18 +574,154 @@
                         <p class="text-gray-600">Turn waste into rewards</p>
                     </div>
                     
+                    ${authError ? `
+                        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
+                            ${authError}
+                        </div>
+                    ` : ''}
+                    
                     <div class="space-y-4">
                         <button
-                            onclick="setCurrentScreen('onboarding')"
-                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors"
+                            onclick="signInWithGoogle()"
+                            ${isLoading ? 'disabled' : ''}
+                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50 flex items-center justify-center space-x-2"
                         >
-                            Sign in with College Email
+                            ${isLoading ? '<div class="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>' : '<i data-lucide="mail" class="w-5 h-5"></i>'}
+                            <span>Sign in with Google</span>
                         </button>
+                        
+                        <div class="relative">
+                            <div class="absolute inset-0 flex items-center">
+                                <div class="w-full border-t border-gray-300"></div>
+                            </div>
+                            <div class="relative flex justify-center text-sm">
+                                <span class="px-2 bg-green-50 text-gray-500">Or</span>
+                            </div>
+                        </div>
+                        
+                        <form onsubmit="handleEmailLogin(event)" class="space-y-4">
+                            <div>
+                                <input
+                                    type="email"
+                                    id="email"
+                                    placeholder="College email"
+                                    required
+                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                />
+                            </div>
+                            <div>
+                                <input
+                                    type="password"
+                                    id="password"
+                                    placeholder="Password"
+                                    required
+                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                />
+                            </div>
+                            <button
+                                type="submit"
+                                ${isLoading ? 'disabled' : ''}
+                                class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50"
+                            >
+                                ${isLoading ? 'Signing in...' : 'Sign In'}
+                            </button>
+                        </form>
+                        
+                        <div class="text-center">
+                            <button
+                                onclick="setCurrentScreen('register')"
+                                class="text-green-600 hover:text-green-700 font-semibold"
+                            >
+                                Don't have an account? Sign up
+                            </button>
+                        </div>
+                        
                         <button
                             onclick="setCurrentScreen('onboarding')"
                             class="w-full border-2 border-green-600 text-green-600 py-4 rounded-2xl font-semibold text-lg hover:bg-green-50 transition-colors"
                         >
-                            Guest/Event Pass
+                            Continue as Guest
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function RegisterScreen() {
+            return `
+                <div class="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 flex flex-col justify-center p-6">
+                    <div class="text-center mb-8">
+                        <div class="bg-green-600 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
+                            <i data-lucide="leaf" class="w-8 h-8 text-white"></i>
+                        </div>
+                        <h1 class="text-3xl font-bold text-green-800 mb-2">Join GreenPoints</h1>
+                        <p class="text-gray-600">Create your account to start earning</p>
+                    </div>
+                    
+                    ${authError ? `
+                        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
+                            ${authError}
+                        </div>
+                    ` : ''}
+                    
+                    <form onsubmit="handleEmailRegister(event)" class="space-y-4">
+                        <div>
+                            <input
+                                type="text"
+                                id="regName"
+                                placeholder="Full name"
+                                required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                            />
+                        </div>
+                        <div>
+                            <input
+                                type="email"
+                                id="regEmail"
+                                placeholder="College email"
+                                required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                            />
+                        </div>
+                        <div>
+                            <select
+                                id="regDepartment"
+                                required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                            >
+                                <option value="">Select Department</option>
+                                <option value="Computer Science">Computer Science</option>
+                                <option value="Mechanical Engineering">Mechanical Engineering</option>
+                                <option value="Environmental Science">Environmental Science</option>
+                                <option value="Business Administration">Business Administration</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                        <div>
+                            <input
+                                type="password"
+                                id="regPassword"
+                                placeholder="Password (min 6 characters)"
+                                required
+                                minlength="6"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                            />
+                        </div>
+                        <button
+                            type="submit"
+                            ${isLoading ? 'disabled' : ''}
+                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50"
+                        >
+                            ${isLoading ? 'Creating account...' : 'Create Account'}
+                        </button>
+                    </form>
+                    
+                    <div class="text-center mt-4">
+                        <button
+                            onclick="setCurrentScreen('login')"
+                            class="text-green-600 hover:text-green-700 font-semibold"
+                        >
+                            Already have an account? Sign in
                         </button>
                     </div>
                 </div>
@@ -222,67 +790,110 @@
         function HomeScreen() {
             return `
                 <div class="min-h-screen bg-gray-50">
-                    <div class="bg-gradient-to-r from-green-600 to-emerald-500 p-6 pb-12">
-                        <div class="flex justify-between items-center mb-6">
+                    <div class="bg-gradient-to-br from-green-700 via-emerald-600 to-teal-500 p-6 pb-28">
+                        <div class="flex items-center justify-between mb-5">
                             <div>
-                                <h1 class="text-white text-2xl font-bold">Good Morning!</h1>
-                                <p class="text-green-100">Ready to go green today?</p>
+                                <p class="text-emerald-100 text-sm">Welcome back</p>
+                                <h1 class="text-white text-2xl font-extrabold tracking-tight">${userData ? userData.displayName : 'Eco Hero'}</h1>
                             </div>
-                            <button
-                                onclick="setCurrentScreen('profile')"
-                                class="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center"
-                            >
-                                <i data-lucide="user" class="w-5 h-5 text-white"></i>
-                            </button>
+                            <div class="flex items-center gap-2">
+                                <button
+                                    onclick="setCurrentScreen('profile')"
+                                    class="w-10 h-10 bg-white/15 hover:bg-white/25 transition rounded-full flex items-center justify-center ring-1 ring-white/20"
+                                >
+                                    <i data-lucide="user" class="w-5 h-5 text-white"></i>
+                                </button>
+                                <button
+                                    onclick="setCurrentScreen('vendor')"
+                                    class="w-10 h-10 bg-white/15 hover:bg-white/25 transition rounded-full flex items-center justify-center ring-1 ring-white/20"
+                                    title="Vendor Dashboard"
+                                >
+                                    <i data-lucide="scan" class="w-5 h-5 text-white"></i>
+                                </button>
+                                <button
+                                    onclick="signOut()"
+                                    class="w-10 h-10 bg-white/15 hover:bg-white/25 transition rounded-full flex items-center justify-center ring-1 ring-white/20"
+                                >
+                                    <i data-lucide="log-out" class="w-5 h-5 text-white"></i>
+                                </button>
+                            </div>
                         </div>
-                        
-                        <div class="bg-white/10 rounded-2xl p-4 mb-4">
-                            <div class="flex justify-between items-center mb-2">
-                                <span class="text-white font-semibold">GreenPoints Balance</span>
-                                <span class="text-white text-2xl font-bold">${userPoints}</span>
+
+                        <div class="relative">
+                            <div class="rounded-2xl p-5 bg-white/10 backdrop-blur-md ring-1 ring-white/20 shadow-lg">
+                                <div class="flex items-center justify-between mb-3">
+                                    <div class="flex items-center gap-2">
+                                        <div class="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center ring-1 ring-white/30">
+                                            <i data-lucide="coins" class="w-5 h-5 text-white"></i>
+                                        </div>
+                                        <span class="text-white/90 font-semibold">GreenPoints</span>
+                                    </div>
+                                    <span class="text-white text-3xl font-extrabold">${userPoints}</span>
+                                </div>
+                                <div class="h-2 w-full bg-white/20 rounded-full overflow-hidden">
+                                    <div class="h-full bg-white/90 rounded-full" style="width: ${Math.min((userPoints / 500) * 100, 100)}%"></div>
+                                </div>
+                                <div class="flex items-center justify-between mt-2">
+                                    <p class="text-emerald-50 text-xs">Progress to Eco Champion</p>
+                                    <p class="text-white text-xs font-semibold">${Math.max(0, 500 - userPoints)} pts left</p>
+                                </div>
                             </div>
-                            <div class="bg-white/20 rounded-full h-2 mb-2">
-                                <div 
-                                    class="bg-white rounded-full h-2" 
-                                    style="width: ${Math.min((userPoints / 500) * 100, 100)}%"
-                                ></div>
-                            </div>
-                            <p class="text-green-100 text-sm">${500 - userPoints} pts to Eco Champion badge</p>
                         </div>
                     </div>
                     
-                    <div class="p-6 -mt-6">
+                    <div class="p-6 -mt-20">
                         <button
                             onclick="setCurrentScreen('scan')"
-                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-bold text-lg mb-6 flex items-center justify-center space-x-2 shadow-lg"
+                            class="w-full bg-gradient-to-r from-emerald-600 to-green-600 text-white py-4 rounded-2xl font-bold text-lg mb-6 flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl transition"
                         >
-                            <i data-lucide="camera" class="w-6 h-6"></i>
-                            <span>📷 Scan Bin QR</span>
+                            <span class="inline-flex items-center gap-2">
+                                <i data-lucide="camera" class="w-6 h-6"></i>
+                                <span>Scan Bin QR</span>
+                            </span>
                         </button>
                         
                         <div class="grid grid-cols-2 gap-4">
                             <button
                                 onclick="setCurrentScreen('rewards')"
-                                class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex flex-col items-center space-y-2"
+                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 hover:shadow-md transition"
                             >
-                                <i data-lucide="gift" class="w-8 h-8 text-orange-500"></i>
+                                <div class="w-11 h-11 rounded-xl bg-orange-50 flex items-center justify-center">
+                                    <i data-lucide="gift" class="w-6 h-6 text-orange-500"></i>
+                                </div>
                                 <span class="font-semibold text-gray-800">Rewards Store</span>
+                                <span class="text-xs text-gray-500">Redeem points instantly</span>
                             </button>
                             
                             <button
                                 onclick="setCurrentScreen('leaderboard')"
-                                class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex flex-col items-center space-y-2"
+                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 hover:shadow-md transition"
                             >
-                                <i data-lucide="trophy" class="w-8 h-8 text-yellow-500"></i>
+                                <div class="w-11 h-11 rounded-xl bg-yellow-50 flex items-center justify-center">
+                                    <i data-lucide="trophy" class="w-6 h-6 text-yellow-500"></i>
+                                </div>
                                 <span class="font-semibold text-gray-800">Leaderboard</span>
+                                <span class="text-xs text-gray-500">Climb the ranks</span>
                             </button>
                             
                             <button
                                 onclick="setCurrentScreen('history')"
-                                class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex flex-col items-center space-y-2 col-span-2"
+                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 col-span-2 hover:shadow-md transition"
                             >
-                                <i data-lucide="history" class="w-8 h-8 text-blue-500"></i>
+                                <div class="w-11 h-11 rounded-xl bg-blue-50 flex items-center justify-center">
+                                    <i data-lucide="history" class="w-6 h-6 text-blue-500"></i>
+                                </div>
                                 <span class="font-semibold text-gray-800">My Recycling History</span>
+                                <span class="text-xs text-gray-500">Track your impact</span>
+                            </button>
+                            <button
+                                onclick="setCurrentScreen('vendor')"
+                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 col-span-2 hover:shadow-md transition"
+                            >
+                                <div class="w-11 h-11 rounded-xl bg-purple-50 flex items-center justify-center">
+                                    <i data-lucide="scan-line" class="w-6 h-6 text-purple-600"></i>
+                                </div>
+                                <span class="font-semibold text-gray-800">Vendor Dashboard</span>
+                                <span class="text-xs text-gray-500">Scan redemption QR</span>
                             </button>
                         </div>
                     </div>
@@ -301,11 +912,13 @@
         }
 
         function ScanScreen() {
+            // auto-start when entering scan screen
+            setTimeout(() => startQrScanner(), 0);
             return `
                 <div class="min-h-screen bg-black relative">
                     <div class="absolute top-6 left-6 z-10">
                         <button
-                            onclick="setCurrentScreen('home')"
+                            onclick="stopQrScanner().then(() => setCurrentScreen('home'))"
                             class="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center"
                         >
                             <i data-lucide="arrow-left" class="w-5 h-5 text-white"></i>
@@ -314,18 +927,13 @@
                     
                     <div class="flex items-center justify-center min-h-screen">
                         <div class="relative">
-                            <div class="w-64 h-64 border-4 border-white rounded-3xl relative overflow-hidden">
-                                <div class="absolute inset-4 border-2 border-green-400 rounded-2xl"></div>
-                                ${scanningQR ? `
-                                    <div class="absolute inset-0 bg-green-400/20 flex items-center justify-center">
-                                        <div class="w-16 h-16 border-4 border-green-400 rounded-full animate-spin border-t-transparent"></div>
-                                    </div>
-                                ` : ''}
+                            <div class="w-72 h-72 border-4 border-white rounded-3xl relative overflow-hidden">
+                                <div id="qr-reader" class="absolute inset-0"></div>
+                                <div class="pointer-events-none absolute inset-4 border-2 border-green-400 rounded-2xl"></div>
                             </div>
                             <div class="absolute -bottom-12 left-1/2 transform -translate-x-1/2">
                                 <button
-                                    onclick="handleScanQR()"
-                                    ${scanningQR ? 'disabled' : ''}
+                                    onclick="startQrScanner()"
                                     class="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg"
                                 >
                                     <i data-lucide="camera" class="w-8 h-8 text-gray-800"></i>
@@ -337,11 +945,47 @@
                     <div class="absolute bottom-6 left-6 right-6">
                         <div class="text-center">
                             <p class="text-white text-lg mb-2">Position QR code inside the frame</p>
-                            <p class="text-gray-300">Each bin has a unique time-bound QR code</p>
+                            <p id="scan-status" class="text-gray-300">Allow camera permission to start scanning</p>
+                            <div class="mt-3 flex items-center justify-center gap-2">
+                                <select id="camera-select" class="px-3 py-2 rounded bg-white text-gray-800 text-sm hidden"></select>
+                                <button onclick="switchSelectedCamera()" class="px-3 py-2 rounded bg-white/80 text-gray-800 text-sm hidden" id="camera-switch-btn">Switch</button>
+                            </div>
                         </div>
                     </div>
                 </div>
             `;
+        }
+
+        async function populateCameraSelector() {
+            await ensureHtml5Qrcode();
+            const cameras = await Html5Qrcode.getCameras();
+            const sel = document.getElementById('camera-select');
+            const btn = document.getElementById('camera-switch-btn');
+            if (!sel || !btn || !cameras || !cameras.length) return;
+            sel.innerHTML = '';
+            cameras.forEach((c) => {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = c.label || c.id;
+                sel.appendChild(opt);
+            });
+            sel.classList.remove('hidden');
+            btn.classList.remove('hidden');
+        }
+
+        async function switchSelectedCamera() {
+            try {
+                const sel = document.getElementById('camera-select');
+                if (!sel || !sel.value) return;
+                await stopQrScanner();
+                await ensureHtml5Qrcode();
+                qrScanner = new Html5Qrcode('qr-reader', { verbose: false });
+                await qrScanner.start({ deviceId: { exact: sel.value } }, { fps: 8, qrbox: { width: 240, height: 240 }, aspectRatio: 1.3 }, onQrSuccess, onQrError);
+                const statusEl = document.getElementById('scan-status');
+                if (statusEl) statusEl.textContent = 'Scanner ready';
+            } catch (e) {
+                alert('Failed to switch camera: ' + e.message);
+            }
         }
 
         function RewardsScreen() {
@@ -399,14 +1043,14 @@
                         <div class="fixed inset-0 bg-black/50 flex items-center justify-center p-6 z-50">
                             <div class="bg-white rounded-2xl p-6 w-full max-w-sm text-center">
                                 <h3 class="text-xl font-bold mb-4">Redemption QR Code</h3>
-                                <div class="w-48 h-48 mx-auto bg-gray-900 rounded-xl mb-4 flex items-center justify-center">
-                                    <i data-lucide="qr-code" class="w-32 h-32 text-white"></i>
+                                <div class="w-48 h-48 mx-auto bg-gray-50 rounded-xl mb-4 flex items-center justify-center overflow-hidden">
+                                    <div id="redemption-qr" class="w-48 h-48 flex items-center justify-center"></div>
                                 </div>
                                 <p class="text-gray-600 mb-2">Show this to the vendor</p>
                                 <p class="text-sm text-red-500 font-semibold">Expires in 5 minutes</p>
                                 <p class="text-lg font-bold mt-2">${selectedReward.name}</p>
                                 <button
-                                    onclick="showRedemptionQR = false; selectedReward = null; renderCurrentScreen()"
+                                    onclick="showRedemptionQR = false; selectedReward = null; currentRedemption = null; renderCurrentScreen()"
                                     class="mt-4 w-full bg-gray-200 text-gray-800 py-2 rounded-lg"
                                 >
                                     Close
@@ -540,8 +1184,8 @@
                                 <div class="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center mx-auto mb-3">
                                     <i data-lucide="user" class="w-8 h-8 text-white"></i>
                                 </div>
-                                <h2 class="text-white text-xl font-bold">You</h2>
-                                <p class="text-green-100">Computer Science</p>
+                                <h2 class="text-white text-xl font-bold">${userData ? userData.displayName : 'User'}</h2>
+                                <p class="text-green-100">${userData ? userData.department : 'Computer Science'}</p>
                             </div>
                         </div>
                     </div>
@@ -597,6 +1241,67 @@
             `;
         }
 
+        function VendorDashboard() {
+            return `
+                <div class="min-h-screen bg-gray-50">
+                    <div class="bg-white shadow-sm p-6 border-b">
+                        <div class="flex items-center space-x-4 mb-4">
+                            <button onclick="setCurrentScreen('home')" class="p-2 -ml-2 rounded-full hover:bg-gray-100">
+                                <i data-lucide="arrow-left" class="w-5 h-5"></i>
+                            </button>
+                            <h1 class="text-2xl font-bold text-gray-800">Vendor Dashboard</h1>
+                        </div>
+                        <p class="text-gray-600">Scan student redemption QR to apply discount</p>
+                    </div>
+                    <div class="p-6">
+                        <div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+                            <div class="w-full max-w-sm mx-auto">
+                                <div class="rounded-xl overflow-hidden border border-gray-200">
+                                    <div class="relative">
+                                        <div class="w-full h-72" id="vendor-qr-reader"></div>
+                                        <div class="pointer-events-none absolute inset-3 border-2 border-emerald-400 rounded-xl"></div>
+                                    </div>
+                                </div>
+                                <div class="mt-4 flex justify-center">
+                                    <button onclick="startVendorScanner()" class="px-4 py-2 bg-emerald-600 text-white rounded-lg">Start Scanner</button>
+                                    <button onclick="stopVendorScanner()" class="ml-2 px-4 py-2 bg-gray-200 rounded-lg">Stop</button>
+                                </div>
+                            </div>
+                            <div id="vendor-status" class="text-center text-gray-600 text-sm mt-3"></div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        let vendorScanner = null;
+        async function startVendorScanner() {
+            try {
+                await ensureCameraAccess();
+                await ensureHtml5Qrcode();
+                if (vendorScanner) return;
+                vendorScanner = new Html5Qrcode('vendor-qr-reader');
+                await vendorScanner.start(
+                    { facingMode: 'environment' },
+                    { fps: 10, qrbox: { width: 240, height: 240 } },
+                    async (text) => {
+                        document.getElementById('vendor-status').innerText = 'Processing...';
+                        await stopVendorScanner();
+                        await processRedemption(text);
+                    },
+                    () => {}
+                );
+                document.getElementById('vendor-status').innerText = 'Scanner ready';
+            } catch (e) {
+                document.getElementById('vendor-status').innerText = 'Error: ' + e.message;
+            }
+        }
+        async function stopVendorScanner() {
+            if (!vendorScanner) return;
+            try { await vendorScanner.stop(); await vendorScanner.clear(); } catch (_) {}
+            vendorScanner = null;
+        }
+
         function HistoryScreen() {
             return `
                 <div class="min-h-screen bg-gray-50">
@@ -648,6 +1353,9 @@
                 case 'login':
                     app.innerHTML = LoginScreen();
                     break;
+                case 'register':
+                    app.innerHTML = RegisterScreen();
+                    break;
                 case 'onboarding':
                     app.innerHTML = OnboardingScreen();
                     break;
@@ -666,6 +1374,9 @@
                 case 'profile':
                     app.innerHTML = ProfileScreen();
                     break;
+                case 'vendor':
+                    app.innerHTML = VendorDashboard();
+                    break;
                 case 'history':
                     app.innerHTML = HistoryScreen();
                     break;
@@ -675,10 +1386,46 @@
             
             // Initialize Lucide icons
             lucide.createIcons();
+
+            // If redemption modal is open, render the QR locally
+            if (showRedemptionQR && currentRedemption && currentRedemption.id) {
+                renderRedemptionQr();
+            }
         }
 
-        // Initialize app
+        // Initialize app UI immediately
         renderCurrentScreen();
+
+        // Handle Google redirect result on load (mobile-friendly)
+        (async () => {
+            try {
+                const result = await firebase.auth().getRedirectResult();
+                if (result && result.user) {
+                    await handlePostAuth(result.user);
+                    setCurrentScreen('home');
+                }
+            } catch (e) {
+                console.warn('Auth redirect handling failed:', e);
+            }
+        })();
+
+        // Attach Firebase auth state listener (compat)
+        firebase.auth().onAuthStateChanged((user) => {
+            if (user) {
+                currentUser = user.uid;
+                loadUserData(user.uid).then(() => {
+                    if (currentScreen === 'login' || currentScreen === 'register') {
+                        setCurrentScreen('home');
+                    }
+                });
+            } else {
+                currentUser = null;
+                userData = null;
+                if (currentScreen !== 'login' && currentScreen !== 'register' && currentScreen !== 'onboarding') {
+                    setCurrentScreen('login');
+                }
+            }
+        });
     </script>
 </body>
 </html>
