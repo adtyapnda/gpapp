@@ -96,6 +96,9 @@
             background: #ffffff;
             overflow: auto;
         }
+        /* Ensure QR video fills its container */
+        #qr-reader, #vendor-qr-reader { width: 100%; height: 100%; }
+        #qr-reader video, #vendor-qr-reader video { width: 100% !important; height: 100% !important; object-fit: cover; }
     </style>
  </head>
 <body class="min-h-screen flex items-center justify-center p-4 bg-white overflow-hidden font-sans">
@@ -136,6 +139,7 @@
         let isVendorMode = false;
         let vendorData = null;
         let rtdb = null;
+        let previewStream = null; // fallback preview stream when QR lib fails
 
         // Data
         const rewards = [
@@ -457,6 +461,18 @@
             renderCurrentScreen();
         }
 
+        // Click-gesture driven navigation that starts preview+scanner immediately
+        async function goToScan() {
+            currentScreen = 'scan';
+            renderCurrentScreen();
+            try {
+                // Start preview right away under the same user gesture
+                await showCameraPreviewFallback();
+            } catch (_) {}
+            // Also attempt to start the QR scanner right away
+            try { await startQrScanner(); } catch (_) {}
+        }
+
         async function startQrScanner() {
             if (qrScanner) return;
             const containerId = "qr-reader";
@@ -476,7 +492,17 @@
                 await ensureHtml5Qrcode();
                 const mountEl = document.getElementById(containerId);
                 if (!mountEl) throw new Error('Scanner container missing');
-                qrScanner = new Html5Qrcode(containerId, { verbose: false });
+                if (window.Html5Qrcode) {
+                    qrScanner = new Html5Qrcode(containerId, { verbose: false });
+                } else {
+                    console.warn('Scanner lib not loaded; using fallback preview only');
+                    // Keep preview running, don't throw; user can still switch cameras
+                    hasCameraPermission = true;
+                    const cameras = await (navigator.mediaDevices?.enumerateDevices?.() || []);
+                    if (!cameras || !cameras.length) throw new Error('No camera found');
+                    if (statusEl) statusEl.textContent = 'Preview ready; QR engine unavailable (CDN blocked)';
+                    return;
+                }
                 const constraintsList = [
                     { facingMode: 'environment' },
                     { facingMode: 'user' }
@@ -503,10 +529,14 @@
                 console.error('QR start error', e);
                 hasCameraPermission = false;
                 scanningQR = false;
+                const statusEl = document.getElementById('scan-status');
+                if (statusEl) statusEl.textContent = `Error: ${e && e.message ? e.message : 'Unknown error'}`;
                 renderCurrentScreen();
-                setTimeout(() => alert('Unable to access camera: ' + e.message + '\nTips: Close other apps using camera, ensure permission allowed, try switching camera below.'), 0);
-                // Populate camera selector if available
+                // Show selector regardless of outcome
                 try { await populateCameraSelector(); } catch (_) {}
+                // Fallback: show plain camera preview so users still see the camera
+                try { await showCameraPreviewFallback(); } catch (_) {}
+                setTimeout(() => alert('Unable to access camera: ' + (e && e.message ? e.message : e) + '\nTips: Close other apps using camera, ensure permission allowed, try switching camera below.'), 0);
             }
         }
 
@@ -519,6 +549,70 @@
             } catch (_) {}
             qrScanner = null;
             scanningQR = false;
+            // stop fallback preview if running
+            try {
+                if (previewStream) {
+                    previewStream.getTracks().forEach(t => t.stop());
+                }
+            } catch (_) {}
+            previewStream = null;
+            const mount = document.getElementById('qr-reader');
+            if (mount) {
+                const vid = mount.querySelector('video[data-fallback="1"]');
+                if (vid) {
+                    try { vid.srcObject = null; } catch (_) {}
+                    vid.remove();
+                }
+            }
+        }
+
+        async function showCameraPreviewFallback(deviceId) {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+            const mount = document.getElementById('qr-reader');
+            if (!mount) return;
+            // If already showing fallback, do nothing
+            const existing = mount.querySelector('video[data-fallback="1"]');
+            if (existing) return;
+            // Try multiple constraint options for robustness
+            const options = [
+                deviceId ? { video: { deviceId: { exact: deviceId } } } : { video: { facingMode: 'environment' } },
+                { video: { facingMode: 'user' } },
+                { video: true }
+            ];
+            let stream = null;
+            for (const c of options) {
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia(c);
+                    break;
+                } catch (_) {}
+            }
+            if (!stream) throw new Error('Unable to start camera preview');
+            try {
+                previewStream = stream;
+                const video = document.createElement('video');
+                video.setAttribute('data-fallback', '1');
+                video.autoplay = true;
+                video.playsInline = true;
+                video.muted = true;
+                video.style.width = '100%';
+                video.style.height = '100%';
+                video.style.objectFit = 'cover';
+                video.srcObject = previewStream;
+                mount.appendChild(video);
+                try { await video.play(); } catch (_) {}
+                const statusEl = document.getElementById('scan-status');
+                if (statusEl) statusEl.textContent = 'Camera preview ready (fallback)';
+            } catch (err) {
+                const statusEl = document.getElementById('scan-status');
+                if (statusEl) statusEl.textContent = 'Preview failed: ' + (err && err.message ? err.message : err);
+            }
+        }
+
+        // Navigate away from scan screen instantly and stop scanner in background
+        function handleScanBack() {
+            setCurrentScreen('home');
+            // Stop scanner after navigation to avoid UI hang
+            Promise.resolve().then(() => stopQrScanner()).catch(()=>{});
         }
 
         async function onQrSuccess(decodedText) {
@@ -578,12 +672,17 @@
                 'https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.10/html5-qrcode.min.js',
                 'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.10/dist/html5-qrcode.min.js',
                 'https://unpkg.com/html5-qrcode@2.3.10/dist/html5-qrcode.min.js',
-                'https://unpkg.com/html5-qrcode/dist/html5-qrcode.min.js'
+                'https://unpkg.com/html5-qrcode/dist/html5-qrcode.min.js',
+                'https://cdn.jsdelivr.net/gh/mebjas/html5-qrcode@v2.3.10/minified/html5-qrcode.min.js'
             ];
-            return new Promise((resolve, reject) => {
+            return new Promise((resolve) => {
                 if (window.Html5Qrcode) return resolve();
                 const tryLoad = (idx) => {
-                    if (idx >= sources.length) return reject(new Error('Failed to load html5-qrcode'));
+                    if (idx >= sources.length) {
+                        console.warn('All html5-qrcode sources failed; continuing without scanner lib');
+                        window.__qrLibFailed = true;
+                        return resolve();
+                    }
                     const existing = document.querySelector(`script[data-qr="html5-qrcode-${idx}"]`);
                     if (existing) {
                         existing.addEventListener('load', () => resolve());
@@ -714,9 +813,13 @@
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 throw new Error('Camera API not available in this browser');
             }
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-            // Immediately stop tracks, we only wanted permission and availability check
-            stream.getTracks().forEach(t => t.stop());
+            // Do not pre-open the camera stream here; it can cause NotReadableError.
+            // Just verify that at least one video input device exists.
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const hasVideoInput = devices && devices.some(d => d.kind === 'videoinput');
+            if (!hasVideoInput) {
+                throw new Error('No camera found');
+            }
         }
 
         async function handleRedeemReward(reward) {
@@ -1033,7 +1136,7 @@
                     
                     <div class="p-6 -mt-20">
                         <button
-                            onclick="setCurrentScreen('scan')"
+                            onclick="goToScan()"
                             class="w-full bg-gradient-to-r from-emerald-600 to-green-600 text-white py-4 rounded-2xl font-bold text-lg mb-6 flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl transition ring-1 ring-emerald-400/30"
                         >
                             <span class="inline-flex items-center gap-2">
@@ -1106,10 +1209,11 @@
             setTimeout(() => startQrScanner(), 0);
             return `
                 <div class="h-full bg-black relative">
-                    <div class="absolute top-6 left-6 z-10">
+                    <div class="fixed top-6 left-6 z-50 pointer-events-auto">
                         <button
-                            onclick="stopQrScanner().then(() => setCurrentScreen('home'))"
+                            onclick="handleScanBack()"
                             class="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center"
+                            type="button" aria-label="Back"
                         >
                             <i data-lucide="arrow-left" class="w-5 h-5 text-white"></i>
                         </button>
@@ -1118,7 +1222,7 @@
                     <div class="flex items-center justify-center h-full">
                         <div class="relative">
                             <div class="w-72 h-72 border-4 border-white rounded-3xl relative overflow-hidden">
-                                <div id="qr-reader" class="absolute inset-0"></div>
+                                <div id="qr-reader" class="absolute inset-0" style="width:100%;height:100%;"></div>
                                 <div class="pointer-events-none absolute inset-4 border-2 border-green-400 rounded-2xl"></div>
                             </div>
                             <div class="absolute -bottom-12 left-1/2 transform -translate-x-1/2">
@@ -1137,8 +1241,8 @@
                             <p class="text-white text-lg mb-2">Position QR code inside the frame</p>
                             <p id="scan-status" class="text-gray-300">Allow camera permission to start scanning</p>
                             <div class="mt-3 flex items-center justify-center gap-2">
-                                <select id="camera-select" class="px-3 py-2 rounded bg-white text-gray-800 text-sm hidden"></select>
-                                <button onclick="switchSelectedCamera()" class="px-3 py-2 rounded bg-white/80 text-gray-800 text-sm hidden" id="camera-switch-btn">Switch</button>
+                                <select id="camera-select" class="px-3 py-2 rounded bg-white text-gray-800 text-sm"></select>
+                                <button onclick="switchSelectedCamera()" class="px-3 py-2 rounded bg-white/80 text-gray-800 text-sm" id="camera-switch-btn">Switch</button>
                             </div>
                         </div>
                     </div>
@@ -1161,6 +1265,11 @@
             });
             sel.classList.remove('hidden');
             btn.classList.remove('hidden');
+            // Default to first camera and start fallback preview immediately
+            if (cameras[0] && !sel.value) {
+                sel.value = cameras[0].id;
+            }
+            try { await showCameraPreviewFallback(sel.value || cameras[0]?.id); } catch (_) {}
         }
 
         async function switchSelectedCamera() {
@@ -1174,6 +1283,8 @@
                 const statusEl = document.getElementById('scan-status');
                 if (statusEl) statusEl.textContent = 'Scanner ready';
             } catch (e) {
+                // If switching the qr scanner fails, at least show plain preview
+                try { await showCameraPreviewFallback(document.getElementById('camera-select')?.value); } catch (_) {}
                 alert('Failed to switch camera: ' + e.message);
             }
         }
@@ -1620,6 +1731,14 @@
                     break;
                 case 'scan':
                     app.innerHTML = ScanScreen();
+                    populateCameraSelector().catch(()=>{});
+                    // Start a lightweight camera preview immediately so users see video even if QR lib fails
+                    try { showCameraPreviewFallback(); } catch (_) {}
+                    // Add key handler for quick back from scan
+                    try {
+                        window.removeEventListener('keydown', __scanKeyHandler, true);
+                    } catch (_) {}
+                    window.addEventListener('keydown', __scanKeyHandler, true);
                     break;
                 case 'rewards':
                     app.innerHTML = RewardsScreen();
@@ -1649,6 +1768,15 @@
             // If redemption modal is open, render the QR locally
             if (showRedemptionQR && currentRedemption && currentRedemption.id) {
                 renderRedemptionQr();
+            }
+        }
+
+        // Key handler to exit scan on Esc/Backspace
+        function __scanKeyHandler(ev) {
+            if (currentScreen !== 'scan') return;
+            if (ev.key === 'Escape' || ev.key === 'Backspace') {
+                ev.preventDefault();
+                handleScanBack();
             }
         }
 
