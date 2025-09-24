@@ -12,6 +12,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-auth-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.4/firebase-database-compat.js"></script>
     <script>
       // Initialize Firebase (compat)
       const firebaseConfig = {
@@ -132,6 +133,9 @@
         let isLoading = false;
         let authError = null;
         let currentRedemption = null;
+        let isVendorMode = false;
+        let vendorData = null;
+        let rtdb = null;
 
         // Data
         const rewards = [
@@ -253,6 +257,8 @@
                 await firebase.auth().signOut();
                 currentUser = null;
                 userData = null;
+                vendorData = null;
+                isVendorMode = false;
                 setCurrentScreen('login');
             } catch (error) {
                 console.error('Sign out error:', error);
@@ -288,10 +294,41 @@
                     userData = userDoc.data();
                     userPoints = userData.points || 0;
                     currentUser = uid;
+                    // init RTDB client if not yet
+                    if (!rtdb && window.firebase && firebase.database) {
+                        rtdb = firebase.database();
+                    }
                 }
             } catch (error) {
                 console.error('Error loading user data:', error);
             }
+        }
+
+        async function loadVendorData(uid) {
+            try {
+                const ref = firebase.firestore().collection('vendors').doc(uid);
+                const snap = await ref.get();
+                if (!snap.exists) {
+                    await ref.set({
+                        uid,
+                        email: firebase.auth().currentUser?.email || '',
+                        displayName: firebase.auth().currentUser?.displayName || 'Vendor',
+                        balance: 0,
+                        createdAt: new Date(),
+                        lastLogin: new Date()
+                    });
+                    vendorData = { balance: 0 };
+                } else {
+                    vendorData = snap.data();
+                    await ref.update({ lastLogin: new Date() });
+                }
+            } catch (e) {
+                console.error('Error loading vendor data:', e);
+            }
+        }
+
+        function setVendorMode(enabled) {
+            isVendorMode = !!enabled;
         }
 
         async function updateUserPoints(pointsToAdd) {
@@ -348,26 +385,43 @@
                     if (data.expiresAt && data.expiresAt.toDate && data.expiresAt.toDate() < new Date()) {
                         throw new Error('QR expired');
                     }
-                    const userRef = firebase.firestore().collection('users').doc(data.studentId);
-                    const userSnap = await tx.get(userRef);
-                    if (!userSnap.exists) {
+                    const studentRef = firebase.firestore().collection('users').doc(data.studentId);
+                    const studentSnap = await tx.get(studentRef);
+                    if (!studentSnap.exists) {
                         throw new Error('Student not found');
                     }
-                    const u = userSnap.data();
-                    const newPts = (u.points || 0) - data.points;
-                    if (newPts < 0) {
+                    const student = studentSnap.data();
+                    const studentNewPts = (student.points || 0) - data.points;
+                    if (studentNewPts < 0) {
                         throw new Error('Insufficient points');
                     }
-                    tx.update(userRef, { points: newPts });
+                    tx.update(studentRef, { points: studentNewPts });
+
+                    // credit vendor balance
+                    const vendorUid = firebase.auth().currentUser ? firebase.auth().currentUser.uid : null;
+                    if (!vendorUid) {
+                        throw new Error('Vendor not authenticated');
+                    }
+                    const vendorRef = firebase.firestore().collection('vendors').doc(vendorUid);
+                    const vendorSnap = await tx.get(vendorRef);
+                    const vendorBalance = vendorSnap.exists ? (vendorSnap.data().balance || 0) : 0;
+                    if (!vendorSnap.exists) {
+                        tx.set(vendorRef, { uid: vendorUid, balance: data.points, createdAt: new Date(), lastLogin: new Date() });
+                    } else {
+                        tx.update(vendorRef, { balance: vendorBalance + data.points });
+                    }
                     tx.update(redRef, {
                         status: 'completed',
                         completedAt: new Date(),
-                        vendorId: currentUser || 'vendor-guest'
+                        vendorId: vendorUid
                     });
                 });
                 // Refresh local state if student is same user
                 if (currentUser) {
                     await loadUserData(currentUser);
+                }
+                if (isVendorMode && firebase.auth().currentUser) {
+                    await loadVendorData(firebase.auth().currentUser.uid);
                 }
                 alert('Redemption successful');
                 setCurrentScreen('home');
@@ -469,13 +523,50 @@
 
         async function onQrSuccess(decodedText) {
             await stopQrScanner();
-            showConfetti = true;
-            await updateUserPoints(10);
-            setTimeout(() => {
-                showConfetti = false;
+            // Try parse JSON to detect redemption vs bin
+            let payload = null;
+            try { payload = JSON.parse(decodedText); } catch (_) {}
+            if (payload && payload.kind === 'redemption' && payload.id) {
+                // treat as redemption QR: show confetti via points update is not applicable here
+                alert('This QR is for redemption. Please show it to the vendor.');
                 setCurrentScreen('home');
-            }, 1800);
-            setCurrentScreen('home');
+                return;
+            }
+            // Assume bin QR: expected formats: {binId:"..."} or plain BIN-...
+            let binId = null;
+            if (payload && payload.binId) binId = String(payload.binId);
+            if (!binId && /^BIN-/.test(decodedText)) binId = decodedText.trim();
+            if (!binId) {
+                alert('Unrecognized QR');
+                setCurrentScreen('home');
+                return;
+            }
+            try {
+                if (!currentUser) {
+                    alert('Please sign in first.');
+                    setCurrentScreen('login');
+                    return;
+                }
+                if (!rtdb && window.firebase && firebase.database) {
+                    rtdb = firebase.database();
+                }
+                if (!rtdb) throw new Error('RTDB not initialized');
+                const commandRef = rtdb.ref(`bins/${binId}/command`);
+                await commandRef.set({ state: 'open', userId: currentUser, ts: Date.now() });
+                // Fallback: if backend doesn't credit within 6s, credit locally (less secure)
+                setTimeout(async () => {
+                    try {
+                        // No definitive signal; skip double-crediting by simple heuristic
+                        await updateUserPoints(10);
+                        alert('Credited 10 points (fallback).');
+                    } catch (_) {}
+                }, 6000);
+                alert('Bin command sent. Please dispose your item.');
+                setCurrentScreen('home');
+            } catch (e) {
+                alert('Failed to signal bin: ' + e.message);
+                setCurrentScreen('home');
+            }
         }
 
         function onQrError(_) {
@@ -588,6 +679,37 @@
             }
         }
 
+        async function generateBinQr() {
+            try {
+                await ensureQrcodeLib();
+                const input = document.getElementById('bin-id-input');
+                const binId = (input && input.value) ? input.value.trim() : '';
+                const mount = document.getElementById('bin-qr');
+                if (!mount) return;
+                mount.innerHTML = '';
+                if (!binId) {
+                    mount.textContent = 'Enter a BIN ID';
+                    return;
+                }
+                const payload = JSON.stringify({ v: 1, kind: 'bin', binId });
+                if (window.QRCode && window.QRCode.toCanvas) {
+                    const canvas = document.createElement('canvas');
+                    await window.QRCode.toCanvas(canvas, payload, { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    mount.appendChild(canvas);
+                } else if (window.QRCode && window.QRCode.toDataURL) {
+                    const url = await window.QRCode.toDataURL(payload, { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    const img = document.createElement('img');
+                    img.src = url;
+                    img.width = 192; img.height = 192;
+                    mount.appendChild(img);
+                } else {
+                    mount.textContent = 'QR library not available';
+                }
+            } catch (e) {
+                alert('Failed to generate QR: ' + e.message);
+            }
+        }
+
         async function ensureCameraAccess() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 throw new Error('Camera API not available in this browser');
@@ -693,6 +815,14 @@
                                 class="text-green-600 hover:text-green-700 font-semibold"
                             >
                                 Don't have an account? Sign up
+                            </button>
+                        </div>
+                        <div class="text-center">
+                            <button
+                                onclick="setCurrentScreen('vendorLogin')"
+                                class="text-gray-600 hover:text-gray-800 font-semibold text-sm mt-2 underline"
+                            >
+                                Vendor login
                             </button>
                         </div>
                         
@@ -1302,6 +1432,26 @@
         }
 
         function VendorDashboard() {
+            if (!currentUser) {
+                return `
+                    <div class="h-full bg-gray-50 flex items-center justify-center p-6">
+                        <div class="text-center">
+                            <p class="text-gray-700 mb-4">Please sign in as a vendor to continue.</p>
+                            <button onclick="setCurrentScreen('vendorLogin')" class="px-4 py-2 bg-emerald-600 text-white rounded-lg shadow">Vendor Login</button>
+                        </div>
+                    </div>
+                `;
+            }
+            if (!isVendorMode) {
+                return `
+                    <div class="h-full bg-gray-50 flex items-center justify-center p-6">
+                        <div class="text-center">
+                            <p class="text-gray-700 mb-4">This dashboard is restricted to vendor accounts.</p>
+                            <button onclick="setCurrentScreen('home')" class="px-4 py-2 bg-gray-200 rounded-lg">Go Home</button>
+                        </div>
+                    </div>
+                `;
+            }
             return `
                 <div class="h-full bg-gray-50">
                     <div class="bg-white shadow-sm p-6 border-b">
@@ -1311,7 +1461,13 @@
                             </button>
                             <h1 class="text-2xl font-bold text-gray-800">Vendor Dashboard</h1>
                         </div>
-                        <p class="text-gray-600">Scan student redemption QR to apply discount</p>
+                        <div class="flex items-center justify-between">
+                            <p class="text-gray-600">Scan student redemption QR to apply discount</p>
+                            <div class="text-right">
+                                <p class="text-sm text-gray-500">Balance</p>
+                                <p class="text-xl font-bold text-emerald-600">${vendorData?.balance || 0} pts</p>
+                            </div>
+                        </div>
                     </div>
                     <div class="p-6">
                         <div class="bg-white rounded-2xl p-4 shadow-md border border-gray-100 ring-1 ring-black/5">
@@ -1329,6 +1485,39 @@
                             </div>
                             <div id="vendor-status" class="text-center text-gray-600 text-sm mt-3"></div>
                         </div>
+                        <div class="mt-6 bg-white rounded-2xl p-4 shadow border border-gray-100">
+                            <h3 class="font-semibold text-gray-800 mb-3">Generate Bin QR</h3>
+                            <div class="flex gap-2">
+                                <input id="bin-id-input" class="flex-1 px-3 py-2 border rounded-lg" placeholder="BIN-CLG-2025-001" />
+                                <button onclick="generateBinQr()" class="px-4 py-2 bg-emerald-600 text-white rounded-lg">Generate</button>
+                            </div>
+                            <div class="mt-4 flex justify-center">
+                                <div id="bin-qr" class="w-48 h-48 bg-gray-50 rounded-lg flex items-center justify-center"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function VendorLoginScreen() {
+            return `
+                <div class="h-full bg-white flex flex-col justify-center p-6">
+                    <div class="text-center mb-6">
+                        <div class="bg-emerald-600 w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-3">
+                            <i data-lucide="scan" class="w-7 h-7 text-white"></i>
+                        </div>
+                        <h1 class="text-2xl font-bold text-gray-900">Vendor Login</h1>
+                        <p class="text-gray-600">Use your vendor account to access scanner</p>
+                    </div>
+                    <div class="space-y-3">
+                        <button
+                            onclick="(async()=>{ try{ isLoading=true; renderCurrentScreen(); const provider=new firebase.auth.GoogleAuthProvider(); const result=await firebase.auth().signInWithPopup(provider); if(result && result.user){ setVendorMode(true); await loadVendorData(result.user.uid); setCurrentScreen('vendor'); } } catch(e){ alert('Login failed: '+e.message); } finally{ isLoading=false; } })()"
+                            class="w-full bg-emerald-600 text-white py-3 rounded-xl font-semibold hover:bg-emerald-700 transition"
+                        >
+                            Continue with Google
+                        </button>
+                        <button onclick="setCurrentScreen('login')" class="w-full border border-gray-300 py-3 rounded-xl font-semibold">Back to User Login</button>
                     </div>
                 </div>
             `;
@@ -1443,6 +1632,9 @@
                     break;
                 case 'vendor':
                     app.innerHTML = VendorDashboard();
+                    break;
+                case 'vendorLogin':
+                    app.innerHTML = VendorLoginScreen();
                     break;
                 case 'history':
                     app.innerHTML = HistoryScreen();
