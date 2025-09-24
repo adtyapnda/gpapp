@@ -68,11 +68,42 @@
         .font-sans {
             font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
         }
+        /* Premium device frame wrapper enforcing 9:16 aspect */
+        .device-shell {
+            width: min(100vw - 2rem, 430px);
+            aspect-ratio: 9 / 16;
+        }
+        .device-bezel {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            border-radius: 24px;
+            background: rgba(255, 255, 255, 0.08);
+            box-shadow:
+                0 20px 60px rgba(0, 0, 0, 0.45),
+                inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            overflow: hidden;
+        }
+        .device-screen {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            background: #ffffff;
+            overflow: auto;
+        }
     </style>
-</head>
-<body class="bg-gray-100">
-    <div id="app" class="max-w-sm mx-auto bg-white shadow-2xl min-h-screen font-sans">
-        <!-- App content will be rendered here -->
+ </head>
+<body class="min-h-screen flex items-center justify-center p-4 bg-white overflow-hidden font-sans">
+    <div class="device-shell">
+        <div class="device-bezel">
+            <div id="app" class="device-screen">
+                <!-- App content will be rendered here -->
+            </div>
+        </div>
     </div>
 
     <script>
@@ -299,7 +330,7 @@
                 expiresAt: expiresAt,
             };
             const ref = await firebase.firestore().collection('redemptions').add(redemptionDoc);
-            return ref.id;
+            return { id: ref.id, expiresAt };
         }
 
         async function processRedemption(redemptionId) {
@@ -521,10 +552,26 @@
                 // Prefer canvas for crispness
                 if (window.QRCode && window.QRCode.toCanvas) {
                     const canvas = document.createElement('canvas');
-                    await window.QRCode.toCanvas(canvas, String(currentRedemption.id), { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    const payload = JSON.stringify({
+                        v: 1,
+                        kind: 'redemption',
+                        id: String(currentRedemption.id),
+                        rewardName: currentRedemption.reward?.name,
+                        points: currentRedemption.reward?.points,
+                        exp: currentRedemption.expiresAt ? new Date(currentRedemption.expiresAt).toISOString() : null
+                    });
+                    await window.QRCode.toCanvas(canvas, payload, { width: 192, margin: 2, errorCorrectionLevel: 'M' });
                     mount.appendChild(canvas);
                 } else if (window.QRCode && window.QRCode.toDataURL) {
-                    const url = await window.QRCode.toDataURL(String(currentRedemption.id), { width: 192, margin: 2, errorCorrectionLevel: 'M' });
+                    const payload = JSON.stringify({
+                        v: 1,
+                        kind: 'redemption',
+                        id: String(currentRedemption.id),
+                        rewardName: currentRedemption.reward?.name,
+                        points: currentRedemption.reward?.points,
+                        exp: currentRedemption.expiresAt ? new Date(currentRedemption.expiresAt).toISOString() : null
+                    });
+                    const url = await window.QRCode.toDataURL(payload, { width: 192, margin: 2, errorCorrectionLevel: 'M' });
                     const img = document.createElement('img');
                     img.src = url;
                     img.alt = 'QR';
@@ -551,21 +598,34 @@
         }
 
         async function handleRedeemReward(reward) {
-            if (userPoints >= reward.points) {
+            try {
+                if (!currentUser) {
+                    alert('Please sign in to redeem rewards.');
+                    setCurrentScreen('login');
+                    return;
+                }
+                if (userPoints < reward.points) {
+                    alert('Not enough points');
+                    return;
+                }
                 selectedReward = reward;
-                const redId = await createRedemption(reward);
-                currentRedemption = { id: redId, reward: reward };
+                const red = await createRedemption(reward);
+                if (!red || !red.id) {
+                    throw new Error('Failed to create redemption');
+                }
+                currentRedemption = { id: red.id, reward: reward, expiresAt: red.expiresAt };
                 showRedemptionQR = true;
                 renderCurrentScreen();
-            } else {
-                alert('Not enough points');
+            } catch (e) {
+                console.error('Redeem error:', e);
+                alert('Could not start redemption: ' + (e && e.message ? e.message : 'Unknown error'));
             }
         }
 
         // Screen components
         function LoginScreen() {
             return `
-                <div class="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 flex flex-col justify-center p-6">
+                <div class="h-full bg-gradient-to-br from-green-50 to-emerald-100 flex flex-col justify-center p-6">
                     <div class="text-center mb-8">
                         <div class="bg-green-600 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
                             <i data-lucide="leaf" class="w-8 h-8 text-white"></i>
@@ -606,7 +666,7 @@
                                     id="email"
                                     placeholder="College email"
                                     required
-                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm placeholder-gray-400 shadow-inner"
                                 />
                             </div>
                             <div>
@@ -615,13 +675,13 @@
                                     id="password"
                                     placeholder="Password"
                                     required
-                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                    class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm placeholder-gray-400 shadow-inner"
                                 />
                             </div>
                             <button
                                 type="submit"
                                 ${isLoading ? 'disabled' : ''}
-                                class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50"
+                                class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50 shadow-lg ring-1 ring-emerald-400/30"
                             >
                                 ${isLoading ? 'Signing in...' : 'Sign In'}
                             </button>
@@ -638,7 +698,7 @@
                         
                         <button
                             onclick="setCurrentScreen('onboarding')"
-                            class="w-full border-2 border-green-600 text-green-600 py-4 rounded-2xl font-semibold text-lg hover:bg-green-50 transition-colors"
+                            class="w-full border-2 border-green-600 text-green-600 py-4 rounded-2xl font-semibold text-lg hover:bg-green-50 transition-colors ring-1 ring-emerald-600/20 shadow-sm hover:shadow"
                         >
                             Continue as Guest
                         </button>
@@ -649,7 +709,7 @@
 
         function RegisterScreen() {
             return `
-                <div class="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 flex flex-col justify-center p-6">
+                <div class="h-full bg-gradient-to-br from-green-50 to-emerald-100 flex flex-col justify-center p-6">
                     <div class="text-center mb-8">
                         <div class="bg-green-600 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4">
                             <i data-lucide="leaf" class="w-8 h-8 text-white"></i>
@@ -671,7 +731,7 @@
                                 id="regName"
                                 placeholder="Full name"
                                 required
-                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm placeholder-gray-400 shadow-inner"
                             />
                         </div>
                         <div>
@@ -680,14 +740,14 @@
                                 id="regEmail"
                                 placeholder="College email"
                                 required
-                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm placeholder-gray-400 shadow-inner"
                             />
                         </div>
                         <div>
                             <select
                                 id="regDepartment"
                                 required
-                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm shadow-inner"
                             >
                                 <option value="">Select Department</option>
                                 <option value="Computer Science">Computer Science</option>
@@ -704,13 +764,13 @@
                                 placeholder="Password (min 6 characters)"
                                 required
                                 minlength="6"
-                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent bg-white/80 backdrop-blur-sm placeholder-gray-400 shadow-inner"
                             />
                         </div>
                         <button
                             type="submit"
                             ${isLoading ? 'disabled' : ''}
-                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50"
+                            class="w-full bg-green-600 text-white py-4 rounded-2xl font-semibold text-lg hover:bg-green-700 transition-colors disabled:opacity-50 shadow-lg ring-1 ring-emerald-400/30"
                         >
                             ${isLoading ? 'Creating account...' : 'Create Account'}
                         </button>
@@ -750,7 +810,7 @@
             const currentSlide = slides[onboardingStep];
 
             return `
-                <div class="min-h-screen bg-white flex flex-col">
+                <div class="h-full bg-white flex flex-col">
                     <div class="flex-1 flex flex-col justify-center items-center p-6 text-center">
                         <div class="bg-green-100 w-24 h-24 rounded-full flex items-center justify-center mb-6">
                             <i data-lucide="${currentSlide.icon}" class="w-12 h-12 text-green-600"></i>
@@ -762,7 +822,7 @@
                     <div class="p-6">
                         <div class="flex justify-center space-x-2 mb-6">
                             ${slides.map((_, index) => 
-                                `<div class="w-3 h-3 rounded-full ${index === onboardingStep ? 'bg-green-600' : 'bg-gray-300'}"></div>`
+                                `<div class="w-3 h-3 rounded-full ${index === onboardingStep ? 'bg-green-600 shadow shadow-emerald-400/30' : 'bg-gray-300'}"></div>`
                             ).join('')}
                         </div>
                         
@@ -770,14 +830,14 @@
                             ${onboardingStep > 0 ? `
                                 <button
                                     onclick="onboardingStep--; renderCurrentScreen()"
-                                    class="flex-1 border border-gray-300 text-gray-600 py-3 rounded-xl font-semibold"
+                                    class="flex-1 border border-gray-300 text-gray-600 py-3 rounded-xl font-semibold hover:shadow"
                                 >
                                     Back
                                 </button>
                             ` : ''}
                             <button
                                 onclick="${onboardingStep < slides.length - 1 ? 'onboardingStep++; renderCurrentScreen()' : 'setCurrentScreen(\'home\')'}"
-                                class="flex-1 bg-green-600 text-white py-3 rounded-xl font-semibold"
+                                class="flex-1 bg-green-600 text-white py-3 rounded-xl font-semibold shadow hover:shadow-lg"
                             >
                                 ${onboardingStep < slides.length - 1 ? 'Next' : 'Get Started'}
                             </button>
@@ -789,7 +849,7 @@
 
         function HomeScreen() {
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-gradient-to-br from-green-700 via-emerald-600 to-teal-500 p-6 pb-28">
                         <div class="flex items-center justify-between mb-5">
                             <div>
@@ -844,7 +904,7 @@
                     <div class="p-6 -mt-20">
                         <button
                             onclick="setCurrentScreen('scan')"
-                            class="w-full bg-gradient-to-r from-emerald-600 to-green-600 text-white py-4 rounded-2xl font-bold text-lg mb-6 flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl transition"
+                            class="w-full bg-gradient-to-r from-emerald-600 to-green-600 text-white py-4 rounded-2xl font-bold text-lg mb-6 flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl transition ring-1 ring-emerald-400/30"
                         >
                             <span class="inline-flex items-center gap-2">
                                 <i data-lucide="camera" class="w-6 h-6"></i>
@@ -855,7 +915,7 @@
                         <div class="grid grid-cols-2 gap-4">
                             <button
                                 onclick="setCurrentScreen('rewards')"
-                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 hover:shadow-md transition"
+                                class="bg-white p-4 rounded-2xl shadow-md border border-gray-100 ring-1 ring-black/5 flex flex-col items-center gap-2 hover:shadow-lg transition"
                             >
                                 <div class="w-11 h-11 rounded-xl bg-orange-50 flex items-center justify-center">
                                     <i data-lucide="gift" class="w-6 h-6 text-orange-500"></i>
@@ -866,7 +926,7 @@
                             
                             <button
                                 onclick="setCurrentScreen('leaderboard')"
-                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 hover:shadow-md transition"
+                                class="bg-white p-4 rounded-2xl shadow-md border border-gray-100 ring-1 ring-black/5 flex flex-col items-center gap-2 hover:shadow-lg transition"
                             >
                                 <div class="w-11 h-11 rounded-xl bg-yellow-50 flex items-center justify-center">
                                     <i data-lucide="trophy" class="w-6 h-6 text-yellow-500"></i>
@@ -877,7 +937,7 @@
                             
                             <button
                                 onclick="setCurrentScreen('history')"
-                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 col-span-2 hover:shadow-md transition"
+                                class="bg-white p-4 rounded-2xl shadow-md border border-gray-100 ring-1 ring-black/5 flex flex-col items-center gap-2 col-span-2 hover:shadow-lg transition"
                             >
                                 <div class="w-11 h-11 rounded-xl bg-blue-50 flex items-center justify-center">
                                     <i data-lucide="history" class="w-6 h-6 text-blue-500"></i>
@@ -887,7 +947,7 @@
                             </button>
                             <button
                                 onclick="setCurrentScreen('vendor')"
-                                class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center gap-2 col-span-2 hover:shadow-md transition"
+                                class="bg-white p-4 rounded-2xl shadow-md border border-gray-100 ring-1 ring-black/5 flex flex-col items-center gap-2 col-span-2 hover:shadow-lg transition"
                             >
                                 <div class="w-11 h-11 rounded-xl bg-purple-50 flex items-center justify-center">
                                     <i data-lucide="scan-line" class="w-6 h-6 text-purple-600"></i>
@@ -899,7 +959,7 @@
                     </div>
                     
                     ${showConfetti ? `
-                        <div class="fixed inset-0 pointer-events-none flex items-center justify-center z-50">
+                        <div class="absolute inset-0 pointer-events-none flex items-center justify-center z-50">
                             <div class="bg-green-600 text-white p-8 rounded-2xl shadow-2xl text-center animate-bounce">
                                 <div class="text-6xl mb-4">🎉</div>
                                 <h3 class="text-2xl font-bold mb-2">✅ 10 GreenPoints earned!</h3>
@@ -915,7 +975,7 @@
             // auto-start when entering scan screen
             setTimeout(() => startQrScanner(), 0);
             return `
-                <div class="min-h-screen bg-black relative">
+                <div class="h-full bg-black relative">
                     <div class="absolute top-6 left-6 z-10">
                         <button
                             onclick="stopQrScanner().then(() => setCurrentScreen('home'))"
@@ -925,7 +985,7 @@
                         </button>
                     </div>
                     
-                    <div class="flex items-center justify-center min-h-screen">
+                    <div class="flex items-center justify-center h-full">
                         <div class="relative">
                             <div class="w-72 h-72 border-4 border-white rounded-3xl relative overflow-hidden">
                                 <div id="qr-reader" class="absolute inset-0"></div>
@@ -990,7 +1050,7 @@
 
         function RewardsScreen() {
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-white shadow-sm p-6 border-b">
                         <div class="flex items-center space-x-4 mb-4">
                             <button
@@ -1040,7 +1100,7 @@
                     </div>
                     
                     ${showRedemptionQR && selectedReward ? `
-                        <div class="fixed inset-0 bg-black/50 flex items-center justify-center p-6 z-50">
+                        <div class="absolute inset-0 bg-black/50 flex items-center justify-center p-6 z-50">
                             <div class="bg-white rounded-2xl p-6 w-full max-w-sm text-center">
                                 <h3 class="text-xl font-bold mb-4">Redemption QR Code</h3>
                                 <div class="w-48 h-48 mx-auto bg-gray-50 rounded-xl mb-4 flex items-center justify-center overflow-hidden">
@@ -1067,7 +1127,7 @@
             leaderboard[3].points = userPoints;
             
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-white shadow-sm p-6 border-b">
                         <div class="flex items-center space-x-4 mb-4">
                             <button
@@ -1167,7 +1227,7 @@
 
         function ProfileScreen() {
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-gradient-to-r from-green-600 to-emerald-500 p-6">
                         <div class="flex items-center space-x-4 mb-6">
                             <button
@@ -1243,7 +1303,7 @@
 
         function VendorDashboard() {
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-white shadow-sm p-6 border-b">
                         <div class="flex items-center space-x-4 mb-4">
                             <button onclick="setCurrentScreen('home')" class="p-2 -ml-2 rounded-full hover:bg-gray-100">
@@ -1254,7 +1314,7 @@
                         <p class="text-gray-600">Scan student redemption QR to apply discount</p>
                     </div>
                     <div class="p-6">
-                        <div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+                        <div class="bg-white rounded-2xl p-4 shadow-md border border-gray-100 ring-1 ring-black/5">
                             <div class="w-full max-w-sm mx-auto">
                                 <div class="rounded-xl overflow-hidden border border-gray-200">
                                     <div class="relative">
@@ -1263,8 +1323,8 @@
                                     </div>
                                 </div>
                                 <div class="mt-4 flex justify-center">
-                                    <button onclick="startVendorScanner()" class="px-4 py-2 bg-emerald-600 text-white rounded-lg">Start Scanner</button>
-                                    <button onclick="stopVendorScanner()" class="ml-2 px-4 py-2 bg-gray-200 rounded-lg">Stop</button>
+                                    <button onclick="startVendorScanner()" class="px-4 py-2 bg-emerald-600 text-white rounded-lg shadow ring-1 ring-emerald-400/30">Start Scanner</button>
+                                    <button onclick="stopVendorScanner()" class="ml-2 px-4 py-2 bg-gray-200 rounded-lg shadow-sm">Stop</button>
                                 </div>
                             </div>
                             <div id="vendor-status" class="text-center text-gray-600 text-sm mt-3"></div>
@@ -1287,7 +1347,14 @@
                     async (text) => {
                         document.getElementById('vendor-status').innerText = 'Processing...';
                         await stopVendorScanner();
-                        await processRedemption(text);
+                        let redemptionId = text;
+                        try {
+                            const parsed = JSON.parse(text);
+                            if (parsed && parsed.kind === 'redemption' && parsed.id) {
+                                redemptionId = parsed.id;
+                            }
+                        } catch (_) {}
+                        await processRedemption(redemptionId);
                     },
                     () => {}
                 );
@@ -1304,7 +1371,7 @@
 
         function HistoryScreen() {
             return `
-                <div class="min-h-screen bg-gray-50">
+                <div class="h-full bg-gray-50">
                     <div class="bg-white shadow-sm p-6 border-b">
                         <div class="flex items-center space-x-4">
                             <button
